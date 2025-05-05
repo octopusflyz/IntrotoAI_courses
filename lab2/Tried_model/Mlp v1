@@ -1,0 +1,143 @@
+import math
+import scipy.ndimage as ndimage
+import mnist
+import numpy as np
+import pickle
+from copy import deepcopy
+from typing import List
+from autograd.BaseGraph import Graph
+from autograd.utils import buildgraph,PermIterator
+from autograd.BaseNode import *
+from util import setseed
+
+setseed(0) # 固定随机数种子以提高可复现性
+save_path = "model/ur.npy"
+
+# 超参数
+lr = 1e-3   # 学习率
+wd1 = 1e-4  # L1正则化
+wd2 = 1e-3  # L2正则化
+batchsize = 256
+
+def DataAugmentation(data,label): #数据增广
+    def crop_or_pad(img, target_size=28):
+        h, w = img.shape  
+        if h > target_size:# Crop if larger
+            start_h = (h - target_size) // 2
+            img = img[start_h:start_h+target_size, :]
+        elif h < target_size:# Pad if smaller
+            pad_h = target_size - h
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            img = np.pad(img, ((pad_top, pad_bottom), (0, 0)), mode='constant')
+        h, w = img.shape
+        if w > target_size:
+            start_w = (w - target_size) // 2
+            img = img[:, start_w:start_w+target_size]
+        elif w < target_size:
+            pad_w = target_size - w
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            img = np.pad(img, ((0, 0), (pad_left, pad_right)), mode='constant')
+        return img
+
+    aug_data=[]
+    aug_label=[]
+    for i,img in enumerate(data):
+        img=img.reshape(28,28)
+        #作随机旋转、平移、缩放变换
+        rotated_img = ndimage.rotate(img, np.random.uniform(-10, 10), reshape=False)
+        translated_img = ndimage.shift(img, shift=(np.random.uniform(-5, 5), np.random.uniform(-5, 5)))
+        scaled_img = ndimage.zoom(img, zoom=np.random.uniform(0.8, 1.2))
+
+        #引入随机噪声
+        mean = 0
+        std_dev = 0.1
+        noise = np.random.normal(mean, std_dev, img.shape)
+        noisy_image = img + noise
+
+        #进行强制裁剪或者零填充，变回28*28尺寸
+        rotated_img = crop_or_pad(rotated_img, 28)
+        translated_img = crop_or_pad(translated_img, 28)
+        scaled_img = crop_or_pad(scaled_img, 28)
+
+        #上述操作仅对img副本操作，img本身没变
+        aug_data.append(img.reshape(-1))
+        aug_data.append(rotated_img.reshape(-1))
+        aug_data.append(translated_img.reshape(-1))
+        aug_data.append(scaled_img.reshape(-1))
+        aug_data.append(noisy_image.reshape(-1))
+        for j in range(5):
+            aug_label.append(label[i])
+    #MNist中trnX和trnY是array类型
+
+    return np.array(aug_data), np.array(aug_label) 
+
+def buildGraph(Y):
+    """
+    建图
+    @param Y: n 样本的label
+    @return: Graph类的实例, 建好的图
+    """
+    in_dim=mnist.num_feat #784
+    out_dim=mnist.num_class #10
+    nodes = [
+        StdScaler(X.mean(), X.std()),     # 标准化层
+        Linear(in_dim, 512),                      # 第一个隐藏层
+        BatchNorm(512),                           
+        relu(),                                   
+        Dropout(0.3),                             
+        Linear(512, 128),                        
+        # BatchNorm(256),                           # 批量归一化
+        # relu(),                                   # ReLU 激活函数
+        # Dropout(0.3),                             # Dropout，防止过拟合
+        # Linear(256, 128),                         # 第二个隐藏层
+        BatchNorm(128),
+        relu(),
+        Dropout(0.5),
+        Linear(128, out_dim),                     # 输出层
+        Softmax(),                                # Softmax 激活函数
+        CrossEntropyLoss(Y)                       # 交叉熵损失
+    ]
+    graph=Graph(nodes)
+    return graph
+
+X,Y=DataAugmentation(mnist.trn_X,mnist.trn_Y) #使用增广后的数据作训练
+
+if __name__ == "__main__":
+    graph = buildGraph(Y)
+    # 训练
+    best_train_acc = 0
+    dataloader = PermIterator(X.shape[0], batchsize)
+    for i in range(1, 40+1): #训练的epoch次数
+        hatys = []
+        ys = []
+        losss = []
+        graph.train()
+        for perm in dataloader:
+            tX = X[perm] #输入图片
+            tY = Y[perm] #groundtruth的标签
+            graph[-1].y = tY
+            graph.flush()
+            pred, loss = graph.forward(tX)[-2:] #前向传播
+            hatys.append(np.argmax(pred, axis=1)) #选择概率最高的为模型预测结果
+            ys.append(tY)
+            graph.backward()
+            graph.optimstep(lr, wd1, wd2) #更新参数
+            losss.append(loss)
+        loss = np.average(losss)
+        acc = np.average(np.concatenate(hatys)==np.concatenate(ys))
+        print(f"epoch {i} loss {loss:.3e} acc {acc:.4f}")
+        if acc > best_train_acc:
+            best_train_acc = acc
+            with open(save_path, "wb") as f:
+                pickle.dump(graph, f)
+
+    # 测试
+    with open(save_path, "rb") as f:
+        graph = pickle.load(f)
+    graph.eval()
+    graph.flush()
+    pred = graph.forward(mnist.val_X, removelossnode=1)[-1]
+    haty = np.argmax(pred, axis=1)
+    print("valid acc", np.average(haty==mnist.val_Y))
